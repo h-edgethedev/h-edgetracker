@@ -63,6 +63,101 @@ def ring_svg(pct, total_min, color="#4A9EE0", size=110):
 </svg>"""
 
 
+
+# Cached AI score so we don't call the API on every refresh
+_score_cache = {"key": None, "result": None}
+
+
+def compute_score(sessions: list) -> tuple:
+    """Returns (score 0-100, verdict str, one_liner str, color str)
+    Uses a simple heuristic for live updates; AI score is fetched separately."""
+    if not sessions:
+        return 0, "No Data", "Start tracking to get your daily score.", "#555555"
+    total = sum(s.get("duration", 0) for s in sessions)
+    if total < 10:
+        return 0, "Just Started", "Keep going — score updates as you work.", "#555555"
+    return 0, "Pending", "Hit 'Score My Day' for an AI verdict.", "#888888"
+
+
+def ai_score_day(sessions: list) -> tuple:
+    """Calls Claude to judge the day. Returns (score, verdict, liner, color)."""
+    if not sessions:
+        return 0, "No Data", "No activity recorded yet.", "#555555"
+
+    total = sum(s.get("duration", 0) for s in sessions)
+    log = "\n".join(f"- {s['type']}: \"{s['name']}\" for {s['duration']}min" for s in sessions)
+
+    import ai as ai_module
+    example = '{"score": 75, "verdict": "Productive Day", "liner": "You put in solid work today."}'
+    prompt = (
+        f"Here is someone's full computer activity log for today (total: {total} mins):\n{log}\n\n"
+        "Important context: browsing can be research, YouTube can be learning, switching apps is normal workflow. "
+        "Judge based on the OVERALL picture — did this person use their computer time meaningfully today?\n\n"
+        f"Respond with ONLY a JSON object in this exact format (no markdown, no extra text):\n{example}"
+        "\nScore 0-100. Verdict options: Excellent Day, Productive Day, Balanced, Distracted, Unproductive."
+    )
+
+    raw = ai_module._call_claude(prompt, system="You are a fair, context-aware productivity judge. Never assume YouTube or browsing is automatically bad. Respond only with valid JSON.")
+
+    import json, re
+    try:
+        match = re.search(r'\{.*?\}', raw, re.DOTALL)
+        if match:
+            data = json.loads(match.group())
+            score = max(0, min(100, int(data.get("score", 50))))
+            verdict = data.get("verdict", "Balanced")
+            liner = data.get("liner", "")
+            color = (
+                "#5CB85C" if score >= 80 else
+                "#4A9EE0" if score >= 60 else
+                "#E0A84A" if score >= 40 else
+                "#E07FA0" if score >= 20 else
+                "#E24B4A"
+            )
+            return score, verdict, liner, color
+    except Exception:
+        pass
+    return 50, "Balanced", raw[:120] if raw else "Could not parse score.", "#E0A84A"
+
+
+def send_notification(title: str, message: str):
+    try:
+        from win10toast import ToastNotifier
+        ToastNotifier().show_toast(title, message, duration=8, threaded=True)
+    except Exception:
+        pass
+
+
+def notification_loop(get_sessions_fn):
+    """Fires a notification every 2 hours with AI verdict if key available."""
+    interval = 2 * 60 * 60
+    time.sleep(interval)
+    while True:
+        sessions = get_sessions_fn()
+        if sessions:
+            try:
+                score, verdict, liner, _ = ai_score_day(sessions)
+                send_notification(f"H~EDGE Tracker — {verdict}", f"Score: {score}/100  |  {liner}")
+            except Exception:
+                total = sum(s.get("duration", 0) for s in sessions)
+                send_notification("H~EDGE Tracker", f"{len(sessions)} sessions tracked today — {total} mins total.")
+        time.sleep(interval)
+
+
+
+def has_api_key() -> bool:
+    import json, os
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return True
+    cfg = storage.DATA_DIR / "config.json"
+    if cfg.exists():
+        try:
+            return bool(json.loads(cfg.read_text()).get("api_key"))
+        except Exception:
+            pass
+    return False
+
+
 def main(page: ft.Page):
     page.title = "H~EDGE Tracker"
     page.window_width = 940
@@ -84,6 +179,10 @@ def main(page: ft.Page):
     history_col     = ft.Ref[ft.Column]()
     history_detail  = ft.Ref[ft.Column]()
     hist_ai_text    = ft.Ref[ft.Text]()
+    score_num       = ft.Ref[ft.Text]()
+    score_verdict   = ft.Ref[ft.Text]()
+    score_liner     = ft.Ref[ft.Text]()
+    score_bar       = ft.Ref[ft.Container]()
 
     # ── Helpers ────────────────────────────────────────────────────────────
 
@@ -154,6 +253,18 @@ def main(page: ft.Page):
                     padding=20,
                 )]
             )
+        score, verdict, liner, color = compute_score(sessions)
+        if score_num.current:
+            score_num.current.value = str(score)
+            score_num.current.color = color
+        if score_verdict.current:
+            score_verdict.current.value = verdict
+            score_verdict.current.color = color
+        if score_liner.current:
+            score_liner.current.value = liner
+        if score_bar.current:
+            score_bar.current.width = max(4, int(score * 2.4))
+            score_bar.current.bgcolor = color
         page.update()
 
     def show_day_detail(date_str, sessions):
@@ -237,6 +348,35 @@ def main(page: ft.Page):
             ft.Row(rings, wrap=True, spacing=10, run_spacing=10),
         ]
         page.update()
+
+    def ask_score(_=None):
+        if score_liner.current:
+            score_liner.current.value = "Asking AI to judge your day..."
+        if score_num.current:
+            score_num.current.value = "..."
+            score_num.current.color = "#888888"
+        if score_verdict.current:
+            score_verdict.current.value = "Thinking"
+            score_verdict.current.color = "#888888"
+        page.update()
+
+        def fetch():
+            sessions = storage.load_today()
+            score, verdict, liner, color = ai_score_day(sessions)
+            if score_num.current:
+                score_num.current.value = str(score)
+                score_num.current.color = color
+            if score_verdict.current:
+                score_verdict.current.value = verdict
+                score_verdict.current.color = color
+            if score_liner.current:
+                score_liner.current.value = liner
+            if score_bar.current:
+                score_bar.current.width = max(4, int(score * 2.4))
+                score_bar.current.bgcolor = color
+            page.update()
+
+        threading.Thread(target=fetch, daemon=True).start()
 
     def ask_ai(mode):
         if ai_text.current:
@@ -340,9 +480,39 @@ def main(page: ft.Page):
         bgcolor="#181818", border_radius=8, padding=ft.padding.all(16),
     )
 
+    score_card = ft.Container(
+        content=ft.Column([
+            ft.Text("DAILY SCORE", size=10, color="#555555", weight=ft.FontWeight.W_500),
+            ft.Container(height=6),
+            ft.Row([
+                ft.Text(ref=score_num, value="—", size=32, weight=ft.FontWeight.W_500, color="#555555"),
+                ft.Text("/100", size=14, color="#444444"),
+                ft.Container(expand=True),
+                ft.Text(ref=score_verdict, value="No data", size=13, weight=ft.FontWeight.W_500, color="#555555"),
+            ], vertical_alignment=ft.CrossAxisAlignment.END),
+            ft.Container(height=8),
+            ft.Container(
+                content=ft.Container(ref=score_bar, width=4, height=4, bgcolor="#555555", border_radius=2),
+                bgcolor="#222222", border_radius=2, height=4, width=240,
+            ),
+            ft.Container(height=8),
+            ft.Text(ref=score_liner, value="Track some activity to get your score.", size=11, color="#666666"),
+            ft.Container(height=10),
+            ft.ElevatedButton(
+                "Score My Day",
+                on_click=ask_score,
+                bgcolor="#1e1e1e", color="#aaaaaa", elevation=0,
+                style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=6), side=ft.BorderSide(0.5, "#333333")),
+            ),
+        ], spacing=0),
+        bgcolor="#181818", border_radius=8, padding=ft.padding.all(16),
+    )
+
     left_panel = ft.Container(
         content=ft.Column([
             stats_card,
+            ft.Container(height=12),
+            score_card,
             ft.Container(height=24),
             ft.Text("BREAKDOWN", size=10, color="#555555", weight=ft.FontWeight.W_500),
             ft.Container(height=10),
@@ -419,7 +589,80 @@ def main(page: ft.Page):
     tracker.start()
     refresh_ui()
     threading.Thread(target=live_updater, daemon=True).start()
+    threading.Thread(target=notification_loop, args=(storage.load_today,), daemon=True).start()
+
+
+def run(page: ft.Page):
+    page.title = "H~EDGE Tracker"
+    page.window_width = 940
+    page.window_height = 700
+    page.window_min_width = 700
+    page.window_min_height = 500
+    page.bgcolor = "#111111"
+
+    if not has_api_key():
+        page.padding = 20
+        key_field = ft.TextField(
+            label="Anthropic API Key",
+            hint_text="sk-ant-...",
+            password=True,
+            can_reveal_password=True,
+            bgcolor="#1e1e1e",
+            color="#eeeeee",
+            border_color="#333333",
+            focused_border_color="#4A9EE0",
+            label_style=ft.TextStyle(color="#888888"),
+            width=400,
+        )
+        status_txt = ft.Text("", size=12, color="#E07FA0")
+
+        def save_key(_):
+            key = key_field.value.strip()
+            if not key.startswith("sk-"):
+                status_txt.value = "Invalid key — should start with sk-ant-..."
+                page.update()
+                return
+            ai.set_api_key(key)
+            page.clean()
+            page.padding = 0
+            main(page)
+
+        def skip(_):
+            page.clean()
+            page.padding = 0
+            main(page)
+
+        page.add(ft.Column([
+            ft.Container(height=60),
+            ft.Text("H~EDGE", size=32, weight=ft.FontWeight.W_500, color="#eeeeee", text_align=ft.TextAlign.CENTER),
+            ft.Text("Tracker", size=32, color="#555555", text_align=ft.TextAlign.CENTER),
+            ft.Container(height=40),
+            ft.Text("Welcome! To unlock AI insights,\nenter your Anthropic API key below.", size=14, color="#aaaaaa", text_align=ft.TextAlign.CENTER),
+            ft.Container(height=6),
+            ft.Text("Get a key at console.anthropic.com", size=12, color="#4A9EE0", text_align=ft.TextAlign.CENTER),
+            ft.Container(height=24),
+            key_field,
+            ft.Container(height=8),
+            status_txt,
+            ft.Container(height=16),
+            ft.Row([
+                ft.ElevatedButton(
+                    "Save & Launch",
+                    on_click=save_key,
+                    bgcolor="#4A9EE0", color="#111111",
+                    style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=6)),
+                ),
+                ft.TextButton(
+                    "Skip for now",
+                    on_click=skip,
+                    style=ft.ButtonStyle(color="#555555"),
+                ),
+            ], spacing=12, alignment=ft.MainAxisAlignment.CENTER),
+        ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, expand=True))
+    else:
+        page.padding = 0
+        main(page)
 
 
 if __name__ == "__main__":
-    ft.app(target=main)
+    ft.app(target=run)
